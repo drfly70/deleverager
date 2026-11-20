@@ -1,0 +1,32 @@
+[Unit]
+Description=Deleverager keeper bot (Morpho cbBTC/USDC on Base)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=keeper
+Group=keeper
+WorkingDirectory=/opt/deleverager
+# Secrets live here (root-owned, mode 640, group keeper), never in the repo.
+EnvironmentFile=/etc/deleverager.env
+Environment=STATE_FILE=/var/lib/deleverager/state.json
+ExecStart=/usr/bin/node bot/run.js --loop 30
+Restart=always
+RestartSec=15
+
+# Hardening: the bot only needs the network and its state directory.
+StateDirectory=deleverager
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
