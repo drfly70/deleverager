@@ -48,7 +48,10 @@ async function fetchJson(url) {
 }
 
 function makeDeps() {
-  const provider = new ethers.JsonRpcProvider(env("BASE_RPC", "https://mainnet.base.org"));
+  // staticNetwork: don't probe the chain id (a fresh provider per check would otherwise keep
+  // retrying in the background forever while the RPC is down).
+  const rpc = env("BASE_RPC", "https://mainnet.base.org");
+  const provider = new ethers.JsonRpcProvider(rpc, Number(process.env.CHAIN_ID || 8453), { staticNetwork: true });
   const wallet = new ethers.Wallet(env("KEEPER_PRIVATE_KEY"), provider);
   const d = new ethers.Contract(env("DELEVERAGER_ADDRESS"), ABI, wallet);
   const stateFile = env("STATE_FILE", "./deleverager-state.json");

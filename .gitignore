@@ -3,3 +3,5 @@ artifacts/
 cache/
 .env
 *-state.json
+bot.log
+.env.tmp
