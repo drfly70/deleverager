@@ -46,7 +46,25 @@ DELEVERAGER_ADDRESS=0x... KEEPER_PRIVATE_KEY=0x... node bot/run.js --loop 30
 ```
 
 Optional: `BASE_RPC`, `NOTIFY_URL` (alerts POSTed as plain text), `KYBER_CLIENT_ID`,
-`ONEINCH_API_KEY`, `STATE_FILE`.
+`ONEINCH_API_KEY`, `STATE_FILE`, `HEARTBEAT_URL` (pinged after every completed check).
+
+### Hosting: a small always-on server
+
+The bot must keep running, so it runs on a small Linux server (any provider; 1 vCPU / 1 GB on
+Ubuntu 24.04 is plenty), not on a laptop that sleeps.
+
+1. Create the server and SSH in as root.
+2. Copy the repo to `/opt/deleverager` (for example `git clone` with a read-only GitHub deploy key).
+3. `cd /opt/deleverager && bash deploy/setup-vps.sh`. This installs Node, the dependencies, automatic
+   security updates and the `deleverager` systemd service (restarts on crash and on reboot). It does
+   not start the bot yet.
+4. After deploying the contract, fill in `/etc/deleverager.env` (readable by root and the
+   `keeper` service only), then `systemctl enable --now deleverager`.
+   Logs: `journalctl -u deleverager -f`.
+
+**Dead-man's switch:** create a check at healthchecks.io (free) with period 5 minutes and grace
+5 minutes, and put its ping URL in `HEARTBEAT_URL`. If the server, the network or the bot dies, the
+pings stop and healthchecks.io alerts you; `NOTIFY_URL` alone can't, because a dead bot sends nothing.
 
 ## Owner controls
 

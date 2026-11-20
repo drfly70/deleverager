@@ -11,6 +11,8 @@
 //   KYBER_CLIENT_ID      optional client id sent to KyberSwap (default "deleverager")
 //   ONEINCH_API_KEY      optional: enables 1inch quotes
 //   STATE_FILE           optional: where the bot remembers which daily close it already acted on
+//   HEARTBEAT_URL        optional: pinged (GET) after every completed check, for a dead-man's switch
+//                        such as healthchecks.io; if the pings stop, that service alerts you
 const fs = require("fs");
 const { ethers } = require("ethers");
 const { getQuotes } = require("./quotes");
@@ -115,7 +117,14 @@ function makeDeps() {
 async function once() {
   const r = await runOnce(makeDeps());
   console.log(`${new Date().toISOString()} ${JSON.stringify(r)}`);
+  await heartbeat();
   return r;
+}
+
+// Only reached when a check completed, so a crashed, stuck or offline bot stops pinging.
+async function heartbeat() {
+  if (!process.env.HEARTBEAT_URL) return;
+  try { await fetch(process.env.HEARTBEAT_URL, { signal: AbortSignal.timeout(10000) }); } catch (e) { console.error(`heartbeat failed: ${e.message}`); }
 }
 
 async function main() {
