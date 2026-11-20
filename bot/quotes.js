@@ -72,15 +72,13 @@ async function getQuotes({ amountIn, taker, slippageBps, sources = ["kyberswap",
   clientId = process.env.KYBER_CLIENT_ID || "deleverager", oneinchKey = process.env.ONEINCH_API_KEY }) {
   const quotes = [];
   const errors = {};
-  for (const source of sources) {
-    try {
-      const q = await SOURCES[source]({ amountIn, taker, slippageBps, clientId, oneinchKey });
-      if (!same(q.router, ROUTERS[source])) throw new Error(`unexpected router ${q.router}`);
-      quotes.push({ source, router: ROUTERS[source], data: q.data, amountOut: q.amountOut });
-    } catch (e) {
-      errors[source] = e.message;
-    }
-  }
+  // Ask every source at once: a slow aggregator shouldn't delay (and age) the others' quotes.
+  const results = await Promise.allSettled(sources.map(async (source) => {
+    const q = await SOURCES[source]({ amountIn, taker, slippageBps, clientId, oneinchKey });
+    if (!same(q.router, ROUTERS[source])) throw new Error(`unexpected router ${q.router}`);
+    return { source, router: ROUTERS[source], data: q.data, amountOut: q.amountOut };
+  }));
+  results.forEach((r, i) => (r.status === "fulfilled" ? quotes.push(r.value) : (errors[sources[i]] = r.reason.message)));
   quotes.sort((a, b) => (b.amountOut > a.amountOut ? 1 : b.amountOut < a.amountOut ? -1 : 0));
   quotes.errors = errors;
   return quotes;

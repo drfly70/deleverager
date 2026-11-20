@@ -32,6 +32,7 @@ const ABI = [
 ];
 // The contract refuses attempts with less than 3M gas left (MIN_ATTEMPT_GAS).
 const GAS_LIMIT = 4_000_000n;
+const SEND_TIMEOUT_MS = 120_000;
 const ORACLE_TO_USD = 10n ** 34n; // Morpho oracle scale for cbBTC (8 dp) / USDC (6 dp)
 
 function env(name, fallback) {
@@ -52,6 +53,7 @@ function makeDeps() {
   const d = new ethers.Contract(env("DELEVERAGER_ADDRESS"), ABI, wallet);
   const stateFile = env("STATE_FILE", "./deleverager-state.json");
   let triggerUsd = null;
+  let lastFees = null;
 
   const chain = {
     address: env("DELEVERAGER_ADDRESS"),
@@ -69,11 +71,22 @@ function makeDeps() {
     },
     async send(amount, router, data, tier) {
       try {
-        const rc = await (await d.deleverage(amount, router, data, tier, { gasLimit: GAS_LIMIT })).wait();
+        // Use the confirmed nonce so a send that got stuck earlier is replaced, not queued behind,
+        // and pay at least 25% more than any earlier attempt (replacements need >= 10% more).
+        const [nonce, fee] = await Promise.all([provider.getTransactionCount(wallet.address, "latest"), provider.getFeeData()]);
+        const bump = (now, prev) => { const a = now * 2n, b = prev ? prev * 125n / 100n : 0n; return a > b ? a : b; };
+        lastFees = {
+          maxFeePerGas: bump(fee.maxFeePerGas ?? fee.gasPrice, lastFees?.maxFeePerGas),
+          maxPriorityFeePerGas: bump(fee.maxPriorityFeePerGas ?? 1_000_000n, lastFees?.maxPriorityFeePerGas),
+        };
+        const tx = await d.deleverage(amount, router, data, tier, { gasLimit: GAS_LIMIT, nonce, ...lastFees });
+        // Don't wait forever on a stuck transaction: give up after 2 minutes so the loop keeps running;
+        // the next attempt reuses the nonce and replaces it.
+        const rc = await tx.wait(1, SEND_TIMEOUT_MS);
         const names = rc.logs.map((l) => { try { return d.interface.parseLog(l)?.name; } catch { return null; } });
         return { success: names.includes("Deleveraged"), tx: rc.hash };
       } catch (e) {
-        console.error(`send tier ${tier} reverted: ${e.shortMessage || e.message}`);
+        console.error(`send tier ${tier} failed: ${e.shortMessage || e.message}`);
         return { success: false };
       }
     },
@@ -111,7 +124,8 @@ function makeDeps() {
       }
     },
     loadState: async () => { try { return JSON.parse(fs.readFileSync(stateFile, "utf8")); } catch { return {}; } },
-    saveState: async (s) => fs.writeFileSync(stateFile, JSON.stringify(s)),
+    // Write to a temp file and rename, so a crash mid-write can't leave a corrupt state file.
+    saveState: async (s) => { fs.writeFileSync(`${stateFile}.tmp`, JSON.stringify(s)); fs.renameSync(`${stateFile}.tmp`, stateFile); },
   };
 }
 

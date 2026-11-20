@@ -75,7 +75,8 @@ async function decide(d, s, state) {
   }
   if (s.paused) return { action: "none", reason: "paused" };
   if (s.required === 0n) { delete state.failedAt; return { action: "none", reason: "at or above target" }; }
-  if (state.failedAt && d.now - state.failedAt < RETRY_AFTER_SEC) {
+  // Rule B (health at or below the floor) is an emergency: retry every check; only rule A waits.
+  if (state.failedAt && s.hf > s.floor && d.now - state.failedAt < RETRY_AFTER_SEC) {
     return { action: "none", reason: "waiting to retry after a failed sale" };
   }
 

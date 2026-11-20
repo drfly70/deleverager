@@ -158,9 +158,20 @@ describe("bot: runOnce", function () {
     expect((await runOnce(d)).action).to.equal("none");
   });
 
-  it("after a failed sale, waits before retrying and does not repeat the alert", async function () {
+  it("rule B retries every check after a failure (no wait), without repeating the alert", async function () {
     const chain = fakeChain({ hf: WAD, simulate: () => false, send: () => ({ success: false }) });
     const d = deps({ chain });
+    await runOnce(d);
+    const sends = chain.calls.filter((c) => c[0] === "send").length;
+    d.now += 30;
+    expect((await runOnce(d)).action).to.equal("failed");
+    expect(chain.calls.filter((c) => c[0] === "send").length).to.be.greaterThan(sends);
+    expect(d.notes.length).to.equal(1);
+  });
+
+  it("after a failed rule-A sale, waits before retrying and does not repeat the alert", async function () {
+    const chain = fakeChain({ simulate: () => false, send: () => ({ success: false }) });
+    const d = deps({ chain, signal: async () => ({ triggered: true, day: T0 - DAY }) });
     expect((await runOnce(d)).action).to.equal("failed");
     const sendsAfterFirst = chain.calls.filter((c) => c[0] === "send").length;
     expect(d.notes.length).to.equal(1);
