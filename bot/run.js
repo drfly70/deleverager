@@ -13,9 +13,12 @@
 //   STATE_FILE           optional: where the bot remembers which daily close it already acted on
 //   HEARTBEAT_URL        optional: pinged (GET) after every completed check, for a dead-man's switch
 //                        such as healthchecks.io; if the pings stop, that service alerts you
+//   RULE_A_USD           optional: daily-close threshold for rule A (default: the contract's triggerPrice).
+//                        Lets the onchain trigger sit a bit higher, so a small bounce doesn't block rule A.
+//   CHAIN_ID             optional: chain id to sign for (default 8453, Base)
 const fs = require("fs");
 const { ethers } = require("ethers");
-const { getQuotes } = require("./quotes");
+const { getQuotes, ROUTERS } = require("./quotes");
 const { lastClosedCoinbase, lastClosedKraken, dailyCloseSignal, runOnce } = require("./logic");
 
 const ABI = [
@@ -26,6 +29,10 @@ const ABI = [
   "function FLOOR_HF() view returns (uint256)",
   "function keeper() view returns (address)",
   "function ORACLE() view returns (address)",
+  "function TARGET_HF() view returns (uint256)",
+  "function OWNER() view returns (address)",
+  "function MORPHO() view returns (address)",
+  "function routerAllowed(address) view returns (bool)",
   "function deleverage(uint256,address,bytes,uint8) returns (bool)",
   "event Deleveraged(uint8 tier, uint256 collateralSold, uint256 hfBefore, uint256 hfAfter)",
   "event AttemptFailed(uint8 tier, bytes reason)",
@@ -33,6 +40,9 @@ const ABI = [
 // The contract refuses attempts with less than 3M gas left (MIN_ATTEMPT_GAS).
 const GAS_LIMIT = 4_000_000n;
 const SEND_TIMEOUT_MS = 120_000;
+// Fees of the last send, kept across checks so a stuck transaction (same nonce) is replaced with
+// a fee at least 25% higher (nodes require >= 10% more to replace).
+let lastFees = null;
 const ORACLE_TO_USD = 10n ** 34n; // Morpho oracle scale for cbBTC (8 dp) / USDC (6 dp)
 
 function env(name, fallback) {
@@ -56,33 +66,60 @@ function makeDeps() {
   const d = new ethers.Contract(env("DELEVERAGER_ADDRESS"), ABI, wallet);
   const stateFile = env("STATE_FILE", "./deleverager-state.json");
   let triggerUsd = null;
-  let lastFees = null;
+  let allowed = {};
 
   const chain = {
     address: env("DELEVERAGER_ADDRESS"),
     async read() {
-      const [hf, required, paused, trigger, floor, oracleAddr, keeper, keeperBalance] = await Promise.all([
+      const [hf, required, paused, trigger, floor, oracleAddr, keeper, keeperBalance, target, owner, morpho, kyber, velora, oneinch] = await Promise.all([
         d.healthFactor(), d.requiredSell(), d.paused(), d.triggerPrice(), d.FLOOR_HF(), d.ORACLE(), d.keeper(),
-        provider.getBalance(wallet.address),
+        provider.getBalance(wallet.address), d.TARGET_HF(), d.OWNER(), d.MORPHO(),
+        d.routerAllowed(ROUTERS.kyberswap), d.routerAllowed(ROUTERS.velora), d.routerAllowed(ROUTERS.oneinch),
       ]);
-      const oracle = await new ethers.Contract(oracleAddr, ["function price() view returns (uint256)"], provider).price();
+      const [oracle, authorized] = await Promise.all([
+        new ethers.Contract(oracleAddr, ["function price() view returns (uint256)"], provider).price(),
+        new ethers.Contract(morpho, ["function isAuthorized(address,address) view returns (bool)"], provider).isAuthorized(owner, d.target),
+      ]);
       triggerUsd = Number(trigger / ORACLE_TO_USD);
-      return { hf, required, paused, trigger, floor, oracle, keeperBalance, keeperOk: keeper.toLowerCase() === wallet.address.toLowerCase() };
+      allowed = { kyberswap: kyber, velora, oneinch };
+      return { hf, required, paused, trigger, floor, target, oracle, authorized, keeperBalance, keeperOk: keeper.toLowerCase() === wallet.address.toLowerCase() };
     },
+    // true: would sell; false: the contract would record a failed attempt; null: the call reverts.
     async simulate(amount, router, data, tier) {
-      try { return await d.deleverage.staticCall(amount, router, data, tier, { gasLimit: GAS_LIMIT }); } catch { return false; }
+      try { return await d.deleverage.staticCall(amount, router, data, tier, { gasLimit: GAS_LIMIT }); } catch (e) {
+        console.error(`dry run tier ${tier} via ${router} reverted: ${e.shortMessage || e.message}`);
+        return null;
+      }
     },
     async send(amount, router, data, tier) {
       try {
-        // Use the confirmed nonce so a send that got stuck earlier is replaced, not queued behind,
-        // and pay at least 25% more than any earlier attempt (replacements need >= 10% more).
-        const [nonce, fee] = await Promise.all([provider.getTransactionCount(wallet.address, "latest"), provider.getFeeData()]);
-        const bump = (now, prev) => { const a = now * 2n, b = prev ? prev * 125n / 100n : 0n; return a > b ? a : b; };
-        lastFees = {
-          maxFeePerGas: bump(fee.maxFeePerGas ?? fee.gasPrice, lastFees?.maxFeePerGas),
-          maxPriorityFeePerGas: bump(fee.maxPriorityFeePerGas ?? 1_000_000n, lastFees?.maxPriorityFeePerGas),
-        };
-        const tx = await d.deleverage(amount, router, data, tier, { gasLimit: GAS_LIMIT, nonce, ...lastFees });
+        // Use the confirmed nonce so a send that got stuck earlier is replaced, not queued behind.
+        const [nonce, block, prioRaw, balance] = await Promise.all([
+          provider.getTransactionCount(wallet.address, "latest"), provider.getBlock("latest"),
+          provider.send("eth_maxPriorityFeePerGas", []).then(BigInt).catch(() => 1_000_000n), provider.getBalance(wallet.address),
+        ]);
+        const base = block.baseFeePerGas ?? 0n;
+        let prio = prioRaw > 1_000_000n ? prioRaw : 1_000_000n; // at least 0.001 gwei
+        // 1.5x base fee covers ~20 blocks of the fastest possible base-fee rise on Base.
+        let maxFee = base * 3n / 2n + prio;
+        if (lastFees && lastFees.nonce === nonce) { // replacing a stuck send: pay >= 25% more
+          const up = (v, prev) => (v > prev * 125n / 100n ? v : prev * 125n / 100n);
+          maxFee = up(maxFee, lastFees.maxFeePerGas);
+          prio = up(prio, lastFees.maxPriorityFeePerGas);
+        }
+        // The node rejects the send unless the wallet can cover gasLimit x maxFee. Use what it can
+        // afford if that still clears the current base fee; otherwise report the real cause.
+        const affordable = balance / GAS_LIMIT;
+        if (maxFee > affordable) {
+          if (affordable < base + prio) {
+            console.error(`send tier ${tier}: keeper can't afford gas (balance ${ethers.formatEther(balance)} ETH, base fee ${ethers.formatUnits(base, "gwei")} gwei)`);
+            return { success: false, reason: "funds" };
+          }
+          maxFee = affordable;
+        }
+        if (prio > maxFee) prio = maxFee;
+        lastFees = { nonce, maxFeePerGas: maxFee, maxPriorityFeePerGas: prio };
+        const tx = await d.deleverage(amount, router, data, tier, { gasLimit: GAS_LIMIT, nonce, maxFeePerGas: maxFee, maxPriorityFeePerGas: prio });
         // Don't wait forever on a stuck transaction: give up after 2 minutes so the loop keeps running;
         // the next attempt reuses the nonce and replaces it.
         const rc = await tx.wait(1, SEND_TIMEOUT_MS);
@@ -90,7 +127,7 @@ function makeDeps() {
         return { success: names.includes("Deleveraged"), tx: rc.hash };
       } catch (e) {
         console.error(`send tier ${tier} failed: ${e.shortMessage || e.message}`);
-        return { success: false };
+        return { success: false, reason: e.code === "INSUFFICIENT_FUNDS" ? "funds" : undefined };
       }
     },
   };
@@ -107,16 +144,20 @@ function makeDeps() {
         ]);
         const a = lastClosedCoinbase(cb, now);
         const b = lastClosedKraken(kr, now);
-        const sig = dailyCloseSignal(a, b, triggerUsd);
-        console.log(`daily close: coinbase ${a?.close} kraken ${b?.close} trigger ${triggerUsd} -> ${sig.triggered}`);
+        if (!a || !b) throw new Error(`no closed candle (coinbase ${!!a}, kraken ${!!b})`);
+        const threshold = Number(process.env.RULE_A_USD || triggerUsd);
+        const sig = dailyCloseSignal(a, b, threshold);
+        console.log(`daily close: coinbase ${a.close} kraken ${b.close} threshold ${threshold} -> ${sig.triggered}`);
         return sig;
       } catch (e) {
         console.error(`daily close check failed (rule A skipped this run): ${e.message}`);
-        return { triggered: false, day: null };
+        return { triggered: false, day: null, error: e.message };
       }
     },
     getQuotes: async (args) => {
-      const q = await getQuotes(args);
+      // Only routers the deployed contract allows: a quote for any other router can only revert.
+      const sources = Object.keys(allowed).filter((s) => allowed[s]);
+      const q = await getQuotes({ ...args, sources });
       for (const [k, v] of Object.entries(q.errors)) console.error(`quote ${k} failed: ${v}`);
       return q;
     },
@@ -149,6 +190,11 @@ async function main() {
   const i = process.argv.indexOf("--loop");
   if (i === -1) return once();
   const secs = Number(process.argv[i + 1] || 30);
+  if (!process.env.HEARTBEAT_URL) {
+    const msg = "Bot started WITHOUT a dead-man's switch (HEARTBEAT_URL is not set): nobody will be told if it stops. Add a healthchecks.io ping URL.";
+    console.error(msg);
+    await makeDeps().notify(msg).catch(() => {});
+  }
   for (;;) {
     try { await once(); } catch (e) { console.error(`check failed: ${e.message}`); }
     await new Promise((r) => setTimeout(r, secs * 1000));

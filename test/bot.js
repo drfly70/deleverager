@@ -217,6 +217,84 @@ describe("bot: runOnce", function () {
     expect(d.notes.length).to.equal(1);
   });
 
+  it("never sends when every dry run reverts (no fake tier-1 'failure', no tier 2)", async function () {
+    const chain = fakeChain({ hf: WAD, simulate: () => null });
+    const d = deps({ chain });
+    const r = await runOnce(d);
+    expect(r).to.deep.include({ action: "failed", reason: "reverted" });
+    expect(chain.calls.filter((c) => c[0] === "send")).to.deep.equal([]);
+    expect(d.notes.join(" ")).to.match(/reverted/);
+  });
+
+  it("records the tier-1 failure with a quote whose dry run failed, not one that reverts", async function () {
+    const chain = fakeChain({
+      hf: WAD,
+      simulate: (a, router, data, tier) => (tier === 1 ? (router === "0xK" ? null : false) : router === "0xV"),
+      send: (a, r, data, tier) => ({ success: tier === 2 }),
+    });
+    const d = deps({ chain });
+    const r = await runOnce(d);
+    expect(chain.calls.filter((c) => c[0] === "send").map((c) => [c[2], c[4]])).to.deep.equal([["0xV", 1], ["0xV", 2]]);
+    expect(r.tier).to.equal(2);
+  });
+
+  it("reports when the keeper can't afford gas, instead of 'sale failed'", async function () {
+    const chain = fakeChain({ hf: WAD, send: () => ({ success: false, reason: "funds" }) });
+    const d = deps({ chain });
+    const r = await runOnce(d);
+    expect(r.reason).to.equal("funds");
+    expect(chain.calls.filter((c) => c[0] === "send").length).to.equal(1);
+    expect(d.notes.join(" ")).to.match(/afford gas/);
+  });
+
+  it("alerts after 3 failed chain reads in a row, and throws so no heartbeat is sent", async function () {
+    const chain = fakeChain();
+    chain.read = async () => { throw new Error("rpc down"); };
+    const d = deps({ chain });
+    for (let i = 0; i < 3; i++) {
+      let threw = false;
+      try { await runOnce(d); } catch { threw = true; }
+      expect(threw).to.equal(true);
+      d.now += 30;
+    }
+    expect(d.notes.length).to.equal(1);
+    expect(d.notes[0]).to.match(/can't read Base/);
+  });
+
+  it("alerts after 3 failed daily-close fetches in a row (rule A blind)", async function () {
+    const d = deps({ signal: async () => ({ triggered: false, day: null, error: "kraken: EService:Unavailable" }) });
+    await runOnce(d); await runOnce(d);
+    expect(d.notes.length).to.equal(0);
+    await runOnce(d);
+    expect(d.notes.join(" ")).to.match(/Rule A is blind/);
+  });
+
+  it("alerts once when rule A fires but the oracle is back above the onchain trigger", async function () {
+    const d = deps({ chain: fakeChain({ oracle: px(59500) }), signal: async () => ({ triggered: true, day: T0 - DAY }) });
+    await runOnce(d); d.now += 30; await runOnce(d);
+    expect(d.notes.length).to.equal(1);
+    expect(d.notes[0]).to.match(/Rule A fired/);
+  });
+
+  it("does nothing and alerts if the contract is not authorized on Morpho", async function () {
+    const chain = fakeChain({ hf: WAD });
+    const read = chain.read;
+    chain.read = async () => ({ ...(await read()), authorized: false });
+    const d = deps({ chain });
+    expect((await runOnce(d)).reason).to.match(/not authorized/);
+    expect(chain.calls).to.deep.equal([]);
+    expect(d.notes.join(" ")).to.match(/not authorized/);
+  });
+
+  it("doesn't sell dust when health is already within 1.5% of the target", async function () {
+    const chain = fakeChain({ hf: 149n * WAD / 100n, required: 1000n });
+    const read = chain.read;
+    chain.read = async () => ({ ...(await read()), target: 150n * WAD / 100n });
+    const d = deps({ chain, signal: async () => ({ triggered: true, day: T0 - DAY }) });
+    expect((await runOnce(d)).reason).to.match(/within 1.5%/);
+    expect(chain.calls).to.deep.equal([]);
+  });
+
   it("reports when no aggregator returns a quote", async function () {
     const d = deps({ chain: fakeChain({ hf: WAD }), getQuotes: async () => Object.assign([], { errors: { kyberswap: "down" } }) });
     const r = await runOnce(d);
