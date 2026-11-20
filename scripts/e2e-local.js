@@ -12,6 +12,8 @@ const WAD = 10n ** 18n;
 
 async function main() {
   if (network.name !== "localhost") throw new Error("local fork only");
+  // A fresh `hardhat node` fork can't run calls at the fork block itself; mine one local block first.
+  await network.provider.send("evm_mine", []);
   const [keeper] = await ethers.getSigners();
   const morpho = await ethers.getContractAt(
     ["function idToMarketParams(bytes32) view returns (address,address,address,address,uint256)", "function setAuthorization(address,bool)"], MORPHO);

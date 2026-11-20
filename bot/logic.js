@@ -3,6 +3,22 @@
 const DAY = 86400;
 const TIER1_BPS = 50; // 0.5%
 const TIER2_BPS = 150; // 1.5%, the hard maximum enforced by the contract
+// After a sale fails at both tiers (or gets no quote), wait this long before trying again,
+// so a persistent failure doesn't send a failing transaction every check.
+const RETRY_AFTER_SEC = 120;
+// The same alert is repeated at most this often while the problem persists.
+const REALERT_SEC = 30 * 60;
+// Warn when the keeper wallet's ETH for gas drops below this (wei). A 4M-gas attempt on Base costs
+// a small fraction of it, but at zero the bot can do nothing.
+const MIN_KEEPER_WEI = 5n * 10n ** 14n; // 0.0005 ETH
+
+/** Sends msg unless the same key was alerted within everySec. Mutates state.alerts; caller saves. */
+async function alert(d, state, key, msg, everySec = REALERT_SEC) {
+  state.alerts = state.alerts || {};
+  if (state.alerts[key] && d.now - state.alerts[key] < everySec) return;
+  state.alerts[key] = d.now;
+  await d.notify(msg);
+}
 
 /** Coinbase /products/BTC-USD/candles?granularity=86400 rows: [time, low, high, open, close, volume], newest first. */
 function lastClosedCoinbase(rows, now) {
@@ -43,14 +59,26 @@ async function tryTier(d, amount, tier, slippageBps) {
  */
 async function runOnce(d) {
   const s = await d.chain.read();
+  const state = await d.loadState();
+  const r = await decide(d, s, state);
+  await d.saveState(state);
+  return r;
+}
+
+async function decide(d, s, state) {
   if (s.keeperOk === false) {
-    await d.notify("Bot wallet is not the contract's keeper, so it cannot act. Fix KEEPER_PRIVATE_KEY or call setKeeper.");
+    await alert(d, state, "keeper", "Bot wallet is not the contract's keeper, so it cannot act. Fix KEEPER_PRIVATE_KEY or call setKeeper.");
     return { action: "failed", reason: "not keeper" };
   }
+  if (s.keeperBalance !== undefined && s.keeperBalance < MIN_KEEPER_WEI) {
+    await alert(d, state, "gas", `Keeper wallet is low on ETH for gas (${(Number(s.keeperBalance) / 1e18).toFixed(6)} ETH). Top it up on Base or the bot cannot sell.`, 12 * 3600);
+  }
   if (s.paused) return { action: "none", reason: "paused" };
-  if (s.required === 0n) return { action: "none", reason: "at or above target" };
+  if (s.required === 0n) { delete state.failedAt; return { action: "none", reason: "at or above target" }; }
+  if (state.failedAt && d.now - state.failedAt < RETRY_AFTER_SEC) {
+    return { action: "none", reason: "waiting to retry after a failed sale" };
+  }
 
-  const state = await d.loadState();
   let rule = null;
   if (s.hf <= s.floor) {
     rule = "B";
@@ -68,7 +96,8 @@ async function runOnce(d) {
   const header = `Rule ${rule} (HF ${fmt(s.hf)}):`;
   let r1 = await tryTier(d, s.required, 1, TIER1_BPS);
   if (r1.status === "noquote") {
-    await d.notify(`${header} no swap quote available: ${JSON.stringify(r1.errors || {})}`);
+    state.failedAt = d.now;
+    await alert(d, state, "noquote", `${header} no swap quote available: ${JSON.stringify(r1.errors || {})}. Retrying every ${RETRY_AFTER_SEC / 60} min.`);
     return { action: "failed", rule, reason: "no quote" };
   }
   if (r1.status === "done") return finish(d, state, rule, 1, r1, header);
@@ -80,15 +109,18 @@ async function runOnce(d) {
 
   const r2 = await tryTier(d, s.required, 2, TIER2_BPS);
   if (r2.status === "done") return finish(d, state, rule, 2, r2, header);
-  await d.notify(`${header} sale FAILED at 0.5% and 1.5% slippage. Position unchanged. Check it manually.`);
+  state.failedAt = d.now;
+  await alert(d, state, "failed", `${header} sale FAILED at 0.5% and 1.5% slippage. Position unchanged. Retrying every ${RETRY_AFTER_SEC / 60} min; check it manually.`);
   return { action: "failed", rule, reason: r2.status };
 }
 
 async function finish(d, state, rule, tier, r, header) {
-  const next = { lastRuleADay: rule === "A" ? state.pendingRuleADay : state.lastRuleADay };
-  await d.saveState(next);
+  if (rule === "A") state.lastRuleADay = state.pendingRuleADay;
+  delete state.pendingRuleADay;
+  delete state.failedAt;
+  if (state.alerts) { delete state.alerts.failed; delete state.alerts.noquote; }
   await d.notify(`${header} sold collateral via ${r.source} at tier ${tier} (${tier === 1 ? "0.5%" : "1.5%"} max).${r.tx ? ` tx ${r.tx}` : ""}`);
   return { action: "deleveraged", rule, tier };
 }
 
-module.exports = { lastClosedCoinbase, lastClosedKraken, dailyCloseSignal, runOnce, TIER1_BPS, TIER2_BPS };
+module.exports = { lastClosedCoinbase, lastClosedKraken, dailyCloseSignal, runOnce, TIER1_BPS, TIER2_BPS, RETRY_AFTER_SEC, MIN_KEEPER_WEI };

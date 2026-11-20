@@ -56,12 +56,13 @@ function makeDeps() {
   const chain = {
     address: env("DELEVERAGER_ADDRESS"),
     async read() {
-      const [hf, required, paused, trigger, floor, oracleAddr, keeper] = await Promise.all([
+      const [hf, required, paused, trigger, floor, oracleAddr, keeper, keeperBalance] = await Promise.all([
         d.healthFactor(), d.requiredSell(), d.paused(), d.triggerPrice(), d.FLOOR_HF(), d.ORACLE(), d.keeper(),
+        provider.getBalance(wallet.address),
       ]);
       const oracle = await new ethers.Contract(oracleAddr, ["function price() view returns (uint256)"], provider).price();
       triggerUsd = Number(trigger / ORACLE_TO_USD);
-      return { hf, required, paused, trigger, floor, oracle, keeperOk: keeper.toLowerCase() === wallet.address.toLowerCase() };
+      return { hf, required, paused, trigger, floor, oracle, keeperBalance, keeperOk: keeper.toLowerCase() === wallet.address.toLowerCase() };
     },
     async simulate(amount, router, data, tier) {
       try { return await d.deleverage.staticCall(amount, router, data, tier, { gasLimit: GAS_LIMIT }); } catch { return false; }

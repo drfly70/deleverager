@@ -29,7 +29,7 @@ function fakeChain(o = {}) {
   return {
     calls,
     address: "0x000000000000000000000000000000000000dEaD",
-    read: async () => ({ hf: s.hf, required: s.required, paused: s.paused, trigger: s.trigger, floor: s.floor, oracle: s.oracle, keeperOk: o.keeperOk ?? true }),
+    read: async () => ({ hf: s.hf, required: s.required, paused: s.paused, trigger: s.trigger, floor: s.floor, oracle: s.oracle, keeperOk: o.keeperOk ?? true, keeperBalance: o.keeperBalance ?? 10n ** 16n }),
     simulate: async (a, r, d, t) => { calls.push(["simulate", a, r, d, t]); return s.simulate(a, r, d, t); },
     send: async (a, r, d, t) => { calls.push(["send", a, r, d, t]); return s.send(a, r, d, t); },
   };
@@ -156,6 +156,54 @@ describe("bot: runOnce", function () {
   it("does nothing when no sale is needed", async function () {
     const d = deps({ chain: fakeChain({ required: 0n, hf: WAD }) });
     expect((await runOnce(d)).action).to.equal("none");
+  });
+
+  it("after a failed sale, waits before retrying and does not repeat the alert", async function () {
+    const chain = fakeChain({ hf: WAD, simulate: () => false, send: () => ({ success: false }) });
+    const d = deps({ chain });
+    expect((await runOnce(d)).action).to.equal("failed");
+    const sendsAfterFirst = chain.calls.filter((c) => c[0] === "send").length;
+    expect(d.notes.length).to.equal(1);
+
+    d.now += 30; // next check, inside the retry window: no transaction, no alert
+    expect((await runOnce(d)).reason).to.match(/waiting to retry/);
+    expect(chain.calls.filter((c) => c[0] === "send").length).to.equal(sendsAfterFirst);
+
+    d.now += 120; // retry window over: tries again, but the alert is not repeated within 30 min
+    expect((await runOnce(d)).action).to.equal("failed");
+    expect(chain.calls.filter((c) => c[0] === "send").length).to.be.greaterThan(sendsAfterFirst);
+    expect(d.notes.length).to.equal(1);
+
+    d.now += 31 * 60; // still failing 30+ min later: alerted again
+    await runOnce(d);
+    expect(d.notes.length).to.equal(2);
+  });
+
+  it("a successful sale after failures clears the retry wait", async function () {
+    let ok = false;
+    const chain = fakeChain({ hf: WAD, simulate: () => ok, send: () => ({ success: ok }) });
+    const d = deps({ chain });
+    await runOnce(d);
+    expect(d.state.failedAt).to.be.a("number");
+    ok = true;
+    d.now += 121;
+    expect((await runOnce(d)).action).to.equal("deleveraged");
+    expect(d.state.failedAt).to.equal(undefined);
+  });
+
+  it("warns (at most every 12h) when the keeper wallet is low on gas, and still acts", async function () {
+    const d = deps({ chain: fakeChain({ hf: WAD, keeperBalance: 10n ** 13n }) });
+    expect((await runOnce(d)).action).to.equal("deleveraged");
+    expect(d.notes.filter((n) => /low on ETH/.test(n)).length).to.equal(1);
+    d.now += 3600;
+    await runOnce(d);
+    expect(d.notes.filter((n) => /low on ETH/.test(n)).length).to.equal(1);
+  });
+
+  it("the not-keeper alert is not repeated every check", async function () {
+    const d = deps({ chain: fakeChain({ keeperOk: false }) });
+    await runOnce(d); d.now += 30; await runOnce(d);
+    expect(d.notes.length).to.equal(1);
   });
 
   it("reports when no aggregator returns a quote", async function () {
